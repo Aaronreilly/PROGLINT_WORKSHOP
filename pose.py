@@ -7,12 +7,12 @@ VIDEO_PATH = "bag4.mp4"
 BAG_CONF_THRESH = 0.05
 KP_CONF_THRESH = 0.1          # lowered further — wrist conf drops when gripping something
 
-WRIST_DIST_MULTIPLIER = 1.2   # threshold = bag's own diagonal size * this — scales with distance-to-camera
-
 BAG_CLASS_IDS = [24, 26, 28]   # backpack, handbag, suitcase — ONLY these
 PERSON_CLASS_ID = [0]          # person — ONLY this
 
 # ---------------- MODELS ----------------
+# using the larger "l" models — slower per frame but noticeably more accurate
+# detection/pose than the "n" (nano) models, worth it if your machine can keep up
 pose_model = YOLO("yolov8l-pose.pt")
 bag_model = YOLO("yolov8l.pt")
 
@@ -34,8 +34,22 @@ SKELETON_EDGES = [
 ]
 
 # ---------------- STATE ----------------
-state = "BAG IS KEPT"
+# 5-state cycle, driven purely by wrist-vs-ROI and bag-vs-ROI (no proximity/touch logic needed)
+#   BAG_THERE -> "Bag is there"     : idle, bag resting in ROI
+#   PICKING   -> "picking the bag"  : wrist has entered the ROI
+#   PICKED    -> "bag picked"       : wrist (carrying bag) has left the ROI
+#   PLACING   -> "placing"          : wrist + bag are back inside the ROI
+#   PLACED    -> "placed"           : bag is back in ROI, wrist has left
+state = "BAG_THERE"
 last_bag_box = None
+
+LABELS = {
+    "BAG_THERE": "Bag is there",
+    "PICKING": "picking the bag",
+    "PICKED": "bag picked",
+    "PLACING": "placing",
+    "PLACED": "placed",
+}
 
 # ---------------- HELPERS ----------------
 def box_center(box):
@@ -47,22 +61,6 @@ def box_diagonal(box):
 def in_roi(box, roi):
     cx, cy = box_center(box)
     return roi[0] <= cx <= roi[2] and roi[1] <= cy <= roi[3]
-
-def boxes_overlap(a, b):
-    """True if two xyxy boxes intersect at all."""
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    return not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
-
-def wrist_near_bag(keypoints, bag_box, thresh):
-    bx, by = box_center(bag_box)
-    for idx in [L_WRIST, R_WRIST]:
-        x, y, c = keypoints[idx]
-        if c < KP_CONF_THRESH:
-            continue
-        if np.hypot(x - bx, y - by) < thresh:
-            return True
-    return False
 
 def any_wrist_in_roi(pose_res, roi):
     """True if ANY detected wrist (confident enough) currently sits inside the ROI."""
@@ -105,18 +103,24 @@ ret, first_frame = cap.read()
 if not ret:
     raise RuntimeError("Could not read first frame")
 
-# ---- AUTOMATIC ROI: detect the bag in the first frame, use its box (+padding) as ROI ----
-ROI_PADDING = 40   # pixels of breathing room around the detected bag
-
-auto_res = bag_model(first_frame, verbose=False, conf=BAG_CONF_THRESH, classes=BAG_CLASS_IDS)[0]
+# ---- AUTOMATIC ROI: scan the first few frames, pick the most confident bag detection ----
+ROI_PADDING = 40
+AUTO_ROI_CONF_THRESH = 0.35   # MUCH stricter than tracking conf — a bad initial ROI ruins everything downstream
+AUTO_ROI_SCAN_FRAMES = 15     # check multiple early frames instead of trusting frame 1 alone
 
 best_box = None
 best_conf = 0
-for box in auto_res.boxes:
-    conf = float(box.conf[0])
-    if conf > best_conf:
-        best_box = box.xyxy[0].tolist()
-        best_conf = conf
+scan_frame = first_frame
+for i in range(AUTO_ROI_SCAN_FRAMES):
+    res = bag_model(scan_frame, verbose=False, conf=AUTO_ROI_CONF_THRESH, classes=BAG_CLASS_IDS)[0]
+    for box in res.boxes:
+        conf = float(box.conf[0])
+        if conf > best_conf:
+            best_box = box.xyxy[0].tolist()
+            best_conf = conf
+    ret, scan_frame = cap.read()
+    if not ret:
+        break
 
 if best_box is not None:
     fh, fw = first_frame.shape[:2]
@@ -125,10 +129,20 @@ if best_box is not None:
     x2 = min(fw, int(best_box[2]) + ROI_PADDING)
     y2 = min(fh, int(best_box[3]) + ROI_PADDING)
     roi = (x1, y1, x2, y2)
-    print(f"[auto-ROI] bag detected in frame 1 (conf={best_conf:.2f}) -> ROI = {roi}")
+    print(f"[auto-ROI] bag detected (conf={best_conf:.2f}) -> ROI = {roi}")
+
+    # ---- SHOW the detected ROI on screen and WAIT for a keypress before continuing ----
+    # this is your visual proof of exactly where auto-ROI locked on, and at what confidence
+    preview = first_frame.copy()
+    cv2.rectangle(preview, (x1, y1), (x2, y2), (255, 0, 0), 3)
+    cv2.putText(preview, f"AUTO ROI (conf={best_conf:.2f}) - press any key to start",
+                (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+    cv2.imshow("Auto-ROI Preview - press any key to continue", preview)
+    cv2.waitKey(0)
+    cv2.destroyWindow("Auto-ROI Preview - press any key to continue")
 else:
-    # fallback: no bag found in frame 1, ask user to draw it manually
-    print("[auto-ROI] no bag detected in first frame — falling back to manual selection")
+    # fallback: no bag found in the scanned frames, ask user to draw it manually
+    print("[auto-ROI] no bag detected in first frames — falling back to manual selection")
     roi_box = cv2.selectROI("Select ROI - press ENTER when done", first_frame, False, False)
     cv2.destroyWindow("Select ROI - press ENTER when done")
     x, y, w, h = roi_box
@@ -144,15 +158,22 @@ while cap.isOpened():
     if not ret:
         break
 
-    # ONLY person
-    pose_res = pose_model(frame, verbose=False, classes=PERSON_CLASS_ID)[0]
+    # pose model only ever detects "person" by nature of the model, so no class filter needed
+    pose_res = pose_model(frame, verbose=False)[0]
     # ONLY bag classes
     bag_res = bag_model(frame, verbose=False, conf=BAG_CONF_THRESH, classes=BAG_CLASS_IDS)[0]
 
-    # ---- draw skeleton ----
+    # ---- draw skeleton + person bounding box ----
     if pose_res.keypoints is not None:
         for kp in pose_res.keypoints.data:
             draw_skeleton(frame, kp.tolist())
+
+    if pose_res.boxes is not None and len(pose_res.boxes) > 0:
+        for pbox in pose_res.boxes.xyxy.tolist():
+            draw_label_on_box(frame, pbox, "person", color=(0, 255, 0))
+    else:
+        cv2.putText(frame, "person: NOT DETECTED", (30, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
     # ---- best bag ----
     bag_box = None
@@ -166,68 +187,29 @@ while cap.isOpened():
     if bag_box is not None:
         last_bag_box = bag_box
 
-    # ---- proximity check: wrist distance (scaled to bag size) OR bbox overlap ----
-    person_near_bag = False
-    if bag_box is not None:
-        wrist_thresh = box_diagonal(bag_box) * WRIST_DIST_MULTIPLIER
-
-        # signal 1: wrist close to bag center
-        if pose_res.keypoints is not None:
-            for kp in pose_res.keypoints.data:
-                if wrist_near_bag(kp.tolist(), bag_box, wrist_thresh):
-                    person_near_bag = True
-                    break
-
-        # signal 2: person's bounding box physically overlaps the bag's bounding box
-        if not person_near_bag and pose_res.boxes is not None:
-            for pbox in pose_res.boxes.xyxy.tolist():
-                if boxes_overlap(pbox, bag_box):
-                    person_near_bag = True
-                    break
-
     bag_in_roi = bag_box is not None and in_roi(bag_box, roi)
     wrist_in_roi = any_wrist_in_roi(pose_res, roi)
 
-    # ---- state machine ----
-    if state == "BAG IS KEPT" and person_near_bag:
-        state = "PICKING BAG"
+    # ---- state machine (pure ROI-crossing logic) ----
+    if state in ("BAG_THERE", "PLACED") and wrist_in_roi:
+        state = "PICKING"
 
-    elif state == "PICKING BAG":
-        # switched to wrist-vs-ROI instead of bag-vs-ROI —
-        # the bag itself often gets occluded by the arm/body while being carried,
-        # but the wrist keypoint keeps tracking reliably
+    elif state == "PICKING":
         if not wrist_in_roi:
-            state = "BAG IS PICKED"
-        elif not person_near_bag:
-            state = "BAG IS KEPT"
+            state = "PICKED"
 
-    elif state == "BAG IS PICKED" and wrist_in_roi:
-        state = "PLACING BAG"
+    elif state == "PICKED" and wrist_in_roi and bag_in_roi:
+        state = "PLACING"
 
-    elif state == "PLACING BAG":
-        # bag confirmed back in ROI -> done
-        if bag_box is not None and bag_in_roi:
-            state = "BAG IS KEPT"
-        # OR: hand is back inside the ROI and has let go of the bag
-        # (covers the case where the bag is briefly occluded right after being set down)
-        elif wrist_in_roi and not person_near_bag:
-            state = "BAG IS KEPT"
-        elif not wrist_in_roi:
-            state = "BAG IS PICKED"
-
-    # ---- safety net ----
-    # if the bag is plainly sitting inside the ROI right now and nobody is
-    # touching it, the ground truth is "kept" no matter what the state machine
-    # above concluded (covers cases where the wrist never re-enters the ROI,
-    # e.g. person lets go and walks off camera instead of stepping back through it)
-    if bag_box is not None and bag_in_roi and not person_near_bag:
-        state = "BAG IS KEPT"
+    elif state == "PLACING":
+        if not wrist_in_roi:
+            state = "PLACED"
 
     # ---- draw ROI + bag label ----
     cv2.rectangle(frame, (roi[0], roi[1]), (roi[2], roi[3]), (255, 0, 0), 2)
     box_to_label = bag_box if bag_box is not None else last_bag_box
     if box_to_label is not None:
-        draw_label_on_box(frame, box_to_label, state)
+        draw_label_on_box(frame, box_to_label, LABELS[state])
 
     cv2.imshow("Output", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
