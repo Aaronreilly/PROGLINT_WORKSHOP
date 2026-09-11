@@ -55,9 +55,6 @@ LABELS = {
 def box_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
-def box_diagonal(box):
-    return np.hypot(box[2] - box[0], box[3] - box[1])
-
 def in_roi(box, roi):
     cx, cy = box_center(box)
     return roi[0] <= cx <= roi[2] and roi[1] <= cy <= roi[3]
